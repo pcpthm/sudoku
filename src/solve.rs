@@ -353,15 +353,12 @@ impl Solver {
     fn solve_dfs(&mut self, mut state: State) {
         super::REC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         loop {
-            let ns_applied = self.apply_naked_singles(&mut state);
-            let hs_applied = match find_hidden_single(&state) {
-                None => false,
-                Some((i, d)) => {
-                    self.put(&mut state, i, d);
-                    true
-                }
-            };
-            if !ns_applied && !hs_applied {
+            if self.apply_naked_singles(&mut state) {
+                continue;
+            }
+            if let Some((i, d)) = find_hidden_single(&state) {
+                self.put(&mut state, i, d);
+            } else {
                 break;
             }
         }
