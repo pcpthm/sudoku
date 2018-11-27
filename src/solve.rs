@@ -240,6 +240,29 @@ pub fn find_naked_singles(state: &State) -> GridMask {
     x.0 & !(y.1 | z.1) | y.0 & !(x.1 | z.1) | z.0 & !(x.1 | y.1)
 }
 
+pub fn find_naked_pair(state: &State) -> Option<SquareIndex> {
+    let get = |x, y, z| {
+        let x = state.digit_mask(Digit::new(x));
+        let y = state.digit_mask(Digit::new(y));
+        let z = state.digit_mask(Digit::new(z));
+        (
+            (x ^ y ^ z) & !(x & y & z),
+            x | y | z,
+            !(x ^ y ^ z) & (x | y | z),
+        )
+    };
+    let x = get(1, 2, 3);
+    let y = get(4, 5, 6);
+    let z = get(7, 8, 9);
+    let a = x.0 & y.0 & !z.1 | x.0 & z.0 & !y.1 | y.0 & z.0 & !x.1;
+    let b = x.2 & !(y.1 | z.1) | y.2 & !(x.1 | z.1) | z.2 & !(x.1 | y.1);
+    if !b.is_zero() {
+        iter_mask_indices(b).next()
+    } else {
+        iter_mask_indices(a).next()
+    }
+}
+
 #[derive(Debug)]
 enum SolutionState {
     Invalid,
@@ -339,6 +362,16 @@ impl Solver {
 
     fn branch(&mut self, state: &State) {
         let mut min = (10, Digit::new(1), GridMask::default());
+
+        if let Some(i) = find_naked_pair(state) {
+            return self.branch_impl(
+                state,
+                Digit::all()
+                    .filter(|d| state.is_candidate(i, *d))
+                    .map(|d| (i, d)),
+            );
+        }
+
         let all_units = &MASK.all_units;
 
         'outer: for d in Digit::all() {
