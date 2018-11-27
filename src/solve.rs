@@ -20,7 +20,13 @@ impl GridMask {
         self.0 >> i.get() & 1 != 0
     }
     pub fn is_single(self) -> bool {
-        self.0 != 0 && self.0 & (self.0 - 1) == 0
+        self.count_ones() == 1
+    }
+    pub fn count_ones(self) -> u32 {
+        unsafe {
+            let [x, y] = std::mem::transmute::<_, [i64; 2]>(self);
+            x.count_ones() + y.count_ones()
+        }
     }
 }
 
@@ -74,20 +80,20 @@ impl std::ops::BitXor for GridMask {
 
 const MASK_ALL: GridMask = GridMask::new((1u128 << DIM4) - 1);
 
-struct MaskIter(GridMask);
+struct MaskIter(u128);
 
 fn iter_mask_indices(mask: GridMask) -> impl Iterator<Item = SquareIndex> {
-    MaskIter(mask & MASK_ALL)
+    MaskIter(mask.get() & MASK_ALL.get())
 }
 
 impl Iterator for MaskIter {
     type Item = SquareIndex;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.0.is_zero() {
+        if self.0 == 0 {
             None
         } else {
-            let i = unsafe { SquareIndex::new_unchecked(self.0.get().trailing_zeros() as usize) };
-            self.0 &= (self.0.get() - 1).into();
+            let i = unsafe { SquareIndex::new_unchecked(self.0.trailing_zeros() as usize) };
+            self.0 &= self.0 - 1;
             Some(i)
         }
     }
@@ -199,18 +205,15 @@ impl State {
     }
 }
 
-fn unit_masks() -> impl Iterator<Item = GridMask> {
-    MASK.all_units.iter().cloned()
-}
-
 pub fn find_hidden_single(state: &State) -> Option<(SquareIndex, Digit)> {
+    let all_units = &MASK.all_units;
     for d in Digit::all() {
         let digit_mask = state.digit_mask(d);
         if digit_mask.is_zero() {
             continue;
         }
-        for unit_mask in unit_masks() {
-            let mask = digit_mask & unit_mask;
+        for unit_mask in all_units.iter().cloned() {
+            let mask = GridMask::new(digit_mask.get() & unit_mask.get());
             if mask.is_single() {
                 let i = iter_mask_indices(mask).next().unwrap();
                 return Some((i, d));
@@ -271,7 +274,6 @@ impl Solver {
     }
 
     fn put(&mut self, state: &mut State, i: SquareIndex, d: Digit) {
-        // eprintln!("put {} {}", i.get(), d.get());
         state.assign(i, d);
         self.partial.set(i, Some(d))
     }
@@ -323,18 +325,19 @@ impl Solver {
 
     fn branch(&mut self, state: &State) {
         let mut min = (10, Digit::new(1), GridMask::default());
+        let all_units = &MASK.all_units;
 
         'outer: for d in Digit::all() {
             let digit_mask = state.digit_mask(d);
             if digit_mask.is_zero() {
                 continue;
             }
-            for unit_mask in unit_masks() {
+            for unit_mask in all_units.iter().cloned() {
                 let mask = digit_mask & unit_mask;
                 if mask.is_zero() {
                     continue;
                 }
-                let count = mask.get().count_ones();
+                let count = mask.count_ones();
                 if count < min.0 {
                     min = (count, d, mask);
                     if count <= 2 {
