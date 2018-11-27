@@ -1,3 +1,5 @@
+#![feature(integer_atomics)]
+
 extern crate failure;
 extern crate structopt;
 extern crate sudoku;
@@ -67,5 +69,9 @@ fn main() {
         }
     });
     let duration = instant.elapsed();
-    println!("{}.{:03}s", duration.as_secs(), duration.subsec_millis())
+    println!("{}.{:03}s", duration.as_secs(), duration.subsec_millis());
+    println!(
+        "rec_count = {}",
+        sudoku::REC_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+    );
 }

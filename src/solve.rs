@@ -25,9 +25,7 @@ impl Iterator for MaskIter {
 }
 
 struct MaskConstants {
-    rows: [GridMask; DIM2],
-    cols: [GridMask; DIM2],
-    boxes: [[GridMask; DIM1]; DIM1],
+    all_units: [GridMask; DIM2 * 3],
     adj: [GridMask; DIM4],
 }
 
@@ -56,18 +54,20 @@ impl MaskConstants {
             }
         }
 
+        let mut all_units = [0u128; DIM2 * 3];
+        for i in 0..DIM2 {
+            all_units[i] = rows[i];
+            all_units[DIM2 + i] = cols[i];
+            all_units[DIM2 * 2 + i] = boxes[i / 3][i % 3];
+        }
+
         for y in 0..DIM2 {
             for x in 0..DIM2 {
                 adj[y * DIM2 + x] = rows[y] | cols[x] | boxes[y / 3][x / 3];
             }
         }
 
-        MaskConstants {
-            rows,
-            cols,
-            boxes,
-            adj,
-        }
+        MaskConstants { all_units, adj }
     }
 }
 
@@ -121,16 +121,17 @@ impl State {
 }
 
 fn unit_masks() -> impl Iterator<Item = &'static GridMask> {
-    MASK.rows
-        .iter()
-        .chain(MASK.cols.iter())
-        .chain(MASK.boxes.iter().flatten())
+    MASK.all_units.iter()
 }
 
 fn find_hidden_single(state: &State) -> Option<(SquareIndex, Digit)> {
-    for unit_mask in unit_masks() {
-        for d in Digit::all() {
-            let mask = state.digit_mask(d) & unit_mask;
+    for d in Digit::all() {
+        let digit_mask = state.digit_mask(d);
+        if digit_mask == 0 {
+            continue;
+        }
+        for unit_mask in unit_masks() {
+            let mask = digit_mask & unit_mask;
             if mask != 0 && mask & (mask - 1) == 0 {
                 let i = iter_mask_indices(mask).next().unwrap();
                 return Some((i, d));
@@ -178,6 +179,7 @@ impl Solver {
     }
 
     fn put(&mut self, state: &mut State, i: SquareIndex, d: Digit) {
+        // eprintln!("put {} {}", i.get(), d.get());
         state.assign(i, d);
         self.partial.set(i, Some(d))
     }
@@ -214,29 +216,16 @@ impl Solver {
             let z = get(7, 8, 9);
             x.0 & !(y.1 | z.1) | y.0 & !(x.1 | z.1) | z.0 & !(x.1 | y.1)
         };
-        for i in SquareIndex::all() {
-            let mut count = 0;
-            for d in Digit::all() {
-                if state.is_candidate(i, d) {
-                    count += 1;
-                }
-            }
-            let a = count == 1;
-            let b = mask >> i.get() & 1 != 0;
-            debug_assert!(a == b);
-        }
-        if mask == 0 {
-            return false;
-        }
+        let mut changed = false;
         for i in iter_mask_indices(mask) {
             for d in Digit::all() {
                 if state.is_candidate(i, d) {
                     self.put(state, i, d);
-                    break;
+                    changed = true;
                 }
             }
         }
-        true
+        changed
     }
 
     fn branch_impl(
@@ -254,9 +243,13 @@ impl Solver {
     fn branch(&mut self, state: &State) {
         let mut min = (10, Digit::new(1), 0);
 
-        'outer: for unit_mask in unit_masks() {
-            for d in Digit::all() {
-                let mask = state.digit_mask(d) & unit_mask;
+        'outer: for d in Digit::all() {
+            let digit_mask = state.digit_mask(d);
+            if digit_mask == 0 {
+                continue;
+            }
+            for unit_mask in unit_masks() {
+                let mask = digit_mask & unit_mask;
                 if mask == 0 {
                     continue;
                 }
@@ -274,6 +267,7 @@ impl Solver {
     }
 
     fn solve_dfs(&mut self, mut state: State) {
+        super::REC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         loop {
             let ns_applied = self.apply_naked_singles(&mut state);
             let hs_applied = match find_hidden_single(&state) {
@@ -288,11 +282,10 @@ impl Solver {
             }
         }
         match solution_state(&state) {
-            SolutionState::Invalid => return,
-            SolutionState::Solved => return self.add_solved(),
-            SolutionState::Unsolved => {}
-        };
-        self.branch(&state);
+            SolutionState::Invalid => {}
+            SolutionState::Solved => self.add_solved(),
+            SolutionState::Unsolved => self.branch(&state),
+        }
     }
 
     pub fn solve(&mut self, state: State) -> Solution {

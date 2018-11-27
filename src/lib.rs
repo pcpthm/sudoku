@@ -1,4 +1,4 @@
-#![feature(core_intrinsics)]
+#![feature(core_intrinsics, integer_atomics)]
 
 extern crate failure_derive;
 extern crate lazy_static;
@@ -10,6 +10,9 @@ pub use self::solve::{solve, Solution};
 use failure_derive::Fail;
 use std::intrinsics::assume;
 use std::num::NonZeroU8;
+use std::sync::atomic::AtomicU64;
+
+pub static REC_COUNT: AtomicU64 = AtomicU64::new(0);
 
 const DIM1: usize = 3;
 const DIM2: usize = DIM1 * DIM1;

@@ -12,11 +12,7 @@ fn bench(c: &mut Criterion) {
     for line in f.lines().take(5) {
         let line = line.unwrap();
         let problem = sudoku::parse(line.trim()).unwrap();
-        c.bench_function(line.trim(), move |b| {
-            b.iter(|| {
-                sudoku::solve(&problem)
-            })
-        });
+        c.bench_function(line.trim(), move |b| b.iter(|| sudoku::solve(&problem)));
     }
 }
 
