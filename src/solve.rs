@@ -1,6 +1,7 @@
 use super::{Digit, Grid, SquareIndex, DIM1, DIM2, DIM4};
 use core::arch::x86_64::{__m128i, _mm_and_si128, _mm_or_si128, _mm_xor_si128};
 use lazy_static::lazy_static;
+use std::mem::transmute;
 
 #[repr(align(16))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -19,14 +20,18 @@ impl GridMask {
     pub fn has_bit(self, i: SquareIndex) -> bool {
         self.0 >> i.get() & 1 != 0
     }
-    pub fn is_single(self) -> bool {
-        self.count_ones() == 1
+    pub fn into_u64_parts(self) -> [u64; 2] {
+        unsafe { transmute::<u128, [u64; 2]>(self.0) }
+    }
+    pub fn into_u64_parts_mut(&mut self) -> &mut [u64; 2] {
+        unsafe { transmute::<&mut u128, &mut [u64; 2]>(&mut self.0) }
     }
     pub fn count_ones(self) -> u32 {
-        unsafe {
-            let [x, y] = std::mem::transmute::<_, [i64; 2]>(self);
-            x.count_ones() + y.count_ones()
-        }
+        let [x, y] = self.into_u64_parts();
+        x.count_ones() + y.count_ones()
+    }
+    pub fn is_single(self) -> bool {
+        self.count_ones() == 1
     }
 }
 
@@ -38,13 +43,13 @@ impl From<u128> for GridMask {
 
 impl From<__m128i> for GridMask {
     fn from(value: __m128i) -> Self {
-        GridMask(unsafe { std::mem::transmute(value) })
+        GridMask(unsafe { transmute(value) })
     }
 }
 
 impl From<GridMask> for __m128i {
     fn from(value: GridMask) -> Self {
-        unsafe { std::mem::transmute(value.0) }
+        unsafe { transmute(value.0) }
     }
 }
 
@@ -102,7 +107,6 @@ impl Iterator for MaskIter {
 struct MaskConstants {
     all_units: [GridMask; DIM2 * 3],
     adj: [GridMask; DIM4],
-    singleton_masks: [GridMask; DIM4],
 }
 
 impl MaskConstants {
@@ -143,16 +147,7 @@ impl MaskConstants {
             }
         }
 
-        let mut singleton_masks = [GridMask::default(); DIM4];
-        for i in 0..DIM4 {
-            singleton_masks[i] = GridMask::new(!(1u128 << i));
-        }
-
-        MaskConstants {
-            all_units,
-            adj,
-            singleton_masks,
-        }
+        MaskConstants { all_units, adj }
     }
 }
 
@@ -179,11 +174,11 @@ impl State {
     }
 
     pub fn digit_mask(&self, d: Digit) -> GridMask {
-        self.digit_masks[d.get() as usize - 1]
+        unsafe { self.digit_masks.get_unchecked(d.get() as usize - 1).clone() }
     }
 
     pub fn digit_mask_mut(&mut self, d: Digit) -> &mut GridMask {
-        &mut self.digit_masks[d.get() as usize - 1]
+        unsafe { self.digit_masks.get_unchecked_mut(d.get() as usize - 1) }
     }
 
     pub fn unsolved_mask(&self) -> GridMask {
@@ -197,11 +192,20 @@ impl State {
     pub fn assign(&mut self, i: SquareIndex, d: Digit) {
         debug_assert!(self.is_candidate(i, d));
         *self.digit_mask_mut(d) &= !MASK.adj[i.get()];
-        let mask = MASK.singleton_masks[i.get()];
-        for m in &mut self.digit_masks[..] {
-            *m &= mask;
+
+        let mut f = move |b: usize| {
+            let mask = !(1u64 << (i.get() - b * 64));
+            for m in &mut self.digit_masks[..] {
+                m.into_u64_parts_mut()[b] &= mask;
+            }
+            self.unsolved_mask.into_u64_parts_mut()[b] &= mask;
+        };
+
+        if i.get() < 64 {
+            f(0)
+        } else {
+            f(1)
         }
-        self.unsolved_mask &= mask;
     }
 }
 
@@ -298,13 +302,23 @@ impl Solver {
     }
 
     fn apply_naked_singles(&mut self, state: &mut State) -> bool {
-        let mask = find_naked_singles(state);
+        let mut mask_parts = find_naked_singles(state).into_u64_parts();
         let mut changed = false;
-        for i in iter_mask_indices(mask) {
-            for d in Digit::all() {
-                if state.is_candidate(i, d) {
-                    self.put(state, i, d);
-                    changed = true;
+        for (b, part) in mask_parts.iter_mut().enumerate() {
+            while *part != 0 {
+                let p = *part & (!*part + 1);
+                *part ^= p;
+                for d in Digit::all() {
+                    if (state.digit_mask(d).into_u64_parts()[b] & p) != 0 {
+                        self.put(
+                            state,
+                            unsafe {
+                                SquareIndex::new_unchecked(p.trailing_zeros() as usize + b * 64)
+                            },
+                            d,
+                        );
+                        changed = true;
+                    }
                 }
             }
         }
