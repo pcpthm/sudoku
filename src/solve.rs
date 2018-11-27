@@ -23,8 +23,8 @@ impl GridMask {
     pub fn into_u64_parts(self) -> [u64; 2] {
         unsafe { transmute::<u128, [u64; 2]>(self.0) }
     }
-    pub fn into_u64_parts_mut(&mut self) -> &mut [u64; 2] {
-        unsafe { transmute::<&mut u128, &mut [u64; 2]>(&mut self.0) }
+    pub fn as_u64_parts_mut(&mut self) -> &mut [u64; 2] {
+        unsafe { &mut *(&mut self.0 as *mut u128 as *mut [u64; 2]) }
     }
     pub fn count_ones(self) -> u32 {
         let [x, y] = self.into_u64_parts();
@@ -174,7 +174,7 @@ impl State {
     }
 
     pub fn digit_mask(&self, d: Digit) -> GridMask {
-        unsafe { self.digit_masks.get_unchecked(d.get() as usize - 1).clone() }
+        unsafe { *self.digit_masks.get_unchecked(d.get() as usize - 1) }
     }
 
     pub fn digit_mask_mut(&mut self, d: Digit) -> &mut GridMask {
@@ -196,9 +196,9 @@ impl State {
         let mut f = move |b: usize| {
             let mask = !(1u64 << (i.get() - b * 64));
             for m in &mut self.digit_masks[..] {
-                m.into_u64_parts_mut()[b] &= mask;
+                m.as_u64_parts_mut()[b] &= mask;
             }
-            self.unsolved_mask.into_u64_parts_mut()[b] &= mask;
+            self.unsolved_mask.as_u64_parts_mut()[b] &= mask;
         };
 
         if i.get() < 64 {
@@ -254,12 +254,12 @@ pub fn find_naked_pair(state: &State) -> Option<SquareIndex> {
     let x = get(1, 2, 3);
     let y = get(4, 5, 6);
     let z = get(7, 8, 9);
-    let a = x.0 & y.0 & !z.1 | x.0 & z.0 & !y.1 | y.0 & z.0 & !x.1;
-    let b = x.2 & !(y.1 | z.1) | y.2 & !(x.1 | z.1) | z.2 & !(x.1 | y.1);
-    if !b.is_zero() {
-        iter_mask_indices(b).next()
+    let naked_pairs_a = x.0 & y.0 & !z.1 | x.0 & z.0 & !y.1 | y.0 & z.0 & !x.1;
+    let naked_pairs_b = x.2 & !(y.1 | z.1) | y.2 & !(x.1 | z.1) | z.2 & !(x.1 | y.1);
+    if !naked_pairs_b.is_zero() {
+        iter_mask_indices(naked_pairs_b).next()
     } else {
-        iter_mask_indices(a).next()
+        iter_mask_indices(naked_pairs_a).next()
     }
 }
 
@@ -324,22 +324,18 @@ impl Solver {
         true
     }
 
-    fn apply_naked_singles(&mut self, state: &mut State) -> bool {
-        let mut mask_parts = find_naked_singles(state).into_u64_parts();
+    fn apply_naked_singles(&mut self, state: &mut State, mask: GridMask) -> bool {
         let mut changed = false;
-        for (b, part) in mask_parts.iter_mut().enumerate() {
+        for (b, part) in mask.into_u64_parts().iter_mut().enumerate() {
             while *part != 0 {
                 let p = *part & (!*part + 1);
                 *part ^= p;
                 for d in Digit::all() {
                     if (state.digit_mask(d).into_u64_parts()[b] & p) != 0 {
-                        self.put(
-                            state,
-                            unsafe {
-                                SquareIndex::new_unchecked(p.trailing_zeros() as usize + b * 64)
-                            },
-                            d,
-                        );
+                        let i = unsafe {
+                            SquareIndex::new_unchecked(p.trailing_zeros() as usize + b * 64)
+                        };
+                        self.put(state, i, d);
                         changed = true;
                     }
                 }
@@ -400,7 +396,8 @@ impl Solver {
     fn solve_dfs(&mut self, mut state: State) {
         super::REC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         loop {
-            if self.apply_naked_singles(&mut state) {
+            let naked_singles = find_naked_singles(&state);
+            if self.apply_naked_singles(&mut state, naked_singles) {
                 continue;
             }
             if let Some((i, d)) = find_hidden_single(&state) {
