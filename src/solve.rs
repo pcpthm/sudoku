@@ -396,20 +396,22 @@ impl Solver {
     fn solve_dfs(&mut self, mut state: State) {
         super::REC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         loop {
+            match solution_state(&state) {
+                SolutionState::Invalid => return,
+                SolutionState::Solved => return self.add_solved(),
+                SolutionState::Unsolved => {}
+            }
+
             let naked_singles = find_naked_singles(&state);
             if self.apply_naked_singles(&mut state, naked_singles) {
                 continue;
             }
+
             if let Some((i, d)) = find_hidden_single(&state) {
                 self.put(&mut state, i, d);
             } else {
-                break;
+                return self.branch(&state);
             }
-        }
-        match solution_state(&state) {
-            SolutionState::Invalid => {}
-            SolutionState::Solved => self.add_solved(),
-            SolutionState::Unsolved => self.branch(&state),
         }
     }
 
