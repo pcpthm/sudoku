@@ -610,8 +610,10 @@ impl Solver {
         true
     }
 
-    fn apply_naked_singles(&mut self, state: &mut State, mask: GridMask) -> bool {
-        let mut changed = false;
+    fn apply_naked_singles(&mut self, state: &mut State, mask: GridMask) -> Option<bool> {
+        if mask.is_zero() {
+            return Some(false);
+        }
         for (b, part) in mask.into_u64_parts().iter_mut().enumerate() {
             while *part != 0 {
                 let lsb = *part & (!*part + 1);
@@ -620,14 +622,13 @@ impl Solver {
                     unsafe { SquareIndex::new_unchecked(lsb.trailing_zeros() as usize + b * 64) };
                 let square_mask = state.square_mask(i);
                 if square_mask == 0 {
-                    continue;
+                    return None;
                 }
                 let d = unsafe { Digit::new_unchecked(square_mask.trailing_zeros() as u8 + 1) };
                 self.put(state, i, d);
-                changed = true;
             }
         }
-        changed
+        Some(true)
     }
 
     fn branch_on_pair(&mut self, mut state: State, pair: [(SquareIndex, Digit); 2]) {
@@ -695,8 +696,10 @@ impl Solver {
             }
 
             let naked_singles = find_naked_singles(&state);
-            if self.apply_naked_singles(&mut state, naked_singles) {
-                continue;
+            match self.apply_naked_singles(&mut state, naked_singles) {
+                None => return,
+                Some(true) => continue,
+                Some(false) => {}
             }
 
             if let Some((i, d)) = state.find_hidden_single() {
