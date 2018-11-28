@@ -424,6 +424,10 @@ impl State {
         self.digit_mask(d).has_bit(i)
     }
 
+    pub fn square_mask(&self, i: SquareIndex) -> u32 {
+        self.square_masks[i.get() / DIM1] >> (i.get() % DIM1 * DIM2) & SQUARE_ALL
+    }
+
     pub fn assign(&mut self, i: SquareIndex, d: Digit) {
         //eprintln!("\nassign({:?}, {:?})", i, d);
         debug_assert!(self.is_candidate(i, d));
@@ -489,9 +493,25 @@ impl State {
             .map(|(unit, d)| {
                 let mask = self.digit_mask(d) & MASK.all_units[unit];
                 debug_assert!(mask.count_ones() == 2);
-                let mut iter = iter_mask_indices(mask);
-                let i = iter.next().unwrap();
-                let j = iter.next().unwrap();
+                let [x, y] = mask.into_u64_parts();
+                let (i, j) = if x != 0 {
+                    let i = unsafe { SquareIndex::new_unchecked(x.trailing_zeros() as usize) };
+                    let x = x & (x - 1);
+                    (
+                        i,
+                        if x != 0 {
+                            unsafe { SquareIndex::new_unchecked(x.trailing_zeros() as usize) }
+                        } else {
+                            unsafe { SquareIndex::new_unchecked(y.trailing_zeros() as usize + 64) }
+                        },
+                    )
+                } else {
+                    let i = unsafe { SquareIndex::new_unchecked(y.trailing_zeros() as usize + 64) };
+                    let y = y & (y - 1);
+                    (i, unsafe {
+                        SquareIndex::new_unchecked(y.trailing_zeros() as usize + 64)
+                    })
+                };
                 [(i, d), (j, d)]
             })
     }
@@ -594,17 +614,17 @@ impl Solver {
         let mut changed = false;
         for (b, part) in mask.into_u64_parts().iter_mut().enumerate() {
             while *part != 0 {
-                let p = *part & (!*part + 1);
-                *part ^= p;
-                for d in Digit::all() {
-                    if (state.digit_mask(d).into_u64_parts()[b] & p) != 0 {
-                        let i = unsafe {
-                            SquareIndex::new_unchecked(p.trailing_zeros() as usize + b * 64)
-                        };
-                        self.put(state, i, d);
-                        changed = true;
-                    }
+                let lsb = *part & (!*part + 1);
+                *part ^= lsb;
+                let i =
+                    unsafe { SquareIndex::new_unchecked(lsb.trailing_zeros() as usize + b * 64) };
+                let square_mask = state.square_mask(i);
+                if square_mask == 0 {
+                    continue;
                 }
+                let d = unsafe { Digit::new_unchecked(square_mask.trailing_zeros() as u8 + 1) };
+                self.put(state, i, d);
+                changed = true;
             }
         }
         changed
@@ -621,9 +641,10 @@ impl Solver {
 
     fn branch(&mut self, state: State) {
         if let Some(i) = find_naked_pair(&state) {
-            let mut iter = Digit::all().filter(|d| state.is_candidate(i, *d));
-            let d0 = iter.next().unwrap();
-            let d1 = iter.next().unwrap();
+            let mask = state.square_mask(i);
+            let d0 = unsafe { Digit::new_unchecked(mask.trailing_zeros() as u8 + 1) };
+            let mask = mask & (mask - 1);
+            let d1 = unsafe { Digit::new_unchecked(mask.trailing_zeros() as u8 + 1) };
             return self.branch_on_pair(state, [(i, d0), (i, d1)]);
         }
 
