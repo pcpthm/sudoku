@@ -4,7 +4,7 @@ use super::{Digit, Grid, SquareIndex, DIM1, DIM2, DIM3, DIM4};
 use core::arch::x86_64::{__m128i, _mm_and_si128, _mm_or_si128, _mm_xor_si128};
 use lazy_static::lazy_static;
 use std::mem::transmute;
-use std::ops::{BitAnd, BitAndAssign, BitOr, BitXor, Not, Shl, Shr};
+use std::ops::{BitAnd, BitAndAssign, BitOr, BitXor, Not, Shr};
 
 #[repr(align(16))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -248,24 +248,24 @@ fn update_square_masks(
     *r = *r & !(SQUARE_ALL << (sub_col * DIM2)) | 1u32 << (sub_col * DIM2 + d);
 }
 
+trait BitParallelCounter<T>: Sized + Copy {
+    fn new(x: T, y: T, z: T) -> Self;
+    fn compute(x: Self, y: Self, z: Self) -> T;
+}
+
+trait BitNum:
+    Copy
+    + BitAnd<Self, Output = Self>
+    + BitOr<Self, Output = Self>
+    + BitXor<Self, Output = Self>
+    + Not<Output = Self>
+{
+}
+impl BitNum for StackRowMask {}
+impl BitNum for GridMask {}
+
 #[derive(Debug, Clone, Copy)]
 struct FindSingle<T>(T, T);
-impl<T> FindSingle<T>
-where
-    T: Copy
-        + BitAnd<T, Output = T>
-        + BitOr<T, Output = T>
-        + BitXor<T, Output = T>
-        + Not<Output = T>,
-{
-    pub fn new(x: T, y: T, z: T) -> Self {
-        FindSingle((x ^ y ^ z) & !(x & y & z), x | y | z)
-    }
-
-    pub fn compute(x: FindSingle<T>, y: FindSingle<T>, z: FindSingle<T>) -> T {
-        x.0 & !(y.1 | z.1) | y.0 & !(x.1 | z.1) | z.0 & !(x.1 | y.1)
-    }
-}
 
 impl<T: Shr<usize, Output = T>> Shr<usize> for FindSingle<T> {
     type Output = Self;
@@ -273,14 +273,52 @@ impl<T: Shr<usize, Output = T>> Shr<usize> for FindSingle<T> {
         FindSingle(self.0 >> rhs, self.1 >> rhs)
     }
 }
-impl<T: Shl<usize, Output = T>> Shl<usize> for FindSingle<T> {
-    type Output = Self;
-    fn shl(self, rhs: usize) -> Self::Output {
-        FindSingle(self.0 << rhs, self.1 << rhs)
+
+impl<T: BitNum> BitParallelCounter<T> for FindSingle<T> {
+    fn new(x: T, y: T, z: T) -> Self {
+        FindSingle((x ^ y ^ z) & !(x & y & z), x | y | z)
+    }
+
+    fn compute(x: FindSingle<T>, y: FindSingle<T>, z: FindSingle<T>) -> T {
+        x.0 & !(y.1 | z.1) | y.0 & !(x.1 | z.1) | z.0 & !(x.1 | y.1)
     }
 }
 
-fn find_hidden_single_col(
+#[derive(Debug, Clone, Copy)]
+struct FindPair<T>(T, T, T);
+
+impl<T: Shr<usize, Output = T>> Shr<usize> for FindPair<T> {
+    type Output = Self;
+    fn shr(self, rhs: usize) -> Self::Output {
+        FindPair(self.0 >> rhs, self.1 >> rhs, self.2 >> rhs)
+    }
+}
+
+impl<T: BitNum> BitParallelCounter<T> for FindPair<T> {
+    fn new(x: T, y: T, z: T) -> Self {
+        FindPair(
+            (x ^ y ^ z) & !(x & y & z),
+            x | y | z,
+            !(x ^ y ^ z) & (x | y | z),
+        )
+    }
+
+    fn compute(x: FindPair<T>, y: FindPair<T>, z: FindPair<T>) -> T {
+        let parts = FindPair::compute_parts(x, y, z);
+        parts.0 | parts.1
+    }
+}
+
+impl<T: BitNum> FindPair<T> {
+    pub fn compute_parts(x: FindPair<T>, y: FindPair<T>, z: FindPair<T>) -> (T, T) {
+        (
+            x.0 & y.0 & !z.1 | x.0 & z.0 & !y.1 | y.0 & z.0 & !x.1,
+            x.2 & !(y.1 | z.1) | y.2 & !(x.1 | z.1) | z.2 & !(x.1 | y.1),
+        )
+    }
+}
+
+fn find_hidden_col<Find: BitParallelCounter<StackRowMask>>(
     square_masks: &[StackRowMask; DIM3],
     unsolved_cols: &[StackRowMask; DIM1],
 ) -> Option<(usize, Digit)> {
@@ -288,13 +326,13 @@ fn find_hidden_single_col(
         let unsolved_mask = unsolved_cols[stack];
 
         let get = |x, y, z| {
-            FindSingle::new(
+            Find::new(
                 square_masks[x * DIM1 + stack],
                 square_masks[y * DIM1 + stack],
                 square_masks[z * DIM1 + stack],
             )
         };
-        let mask = unsolved_mask & FindSingle::compute(get(0, 1, 2), get(3, 4, 5), get(6, 7, 8));
+        let mask = unsolved_mask & Find::compute(get(0, 1, 2), get(3, 4, 5), get(6, 7, 8));
         if mask != 0 {
             let k = mask.trailing_zeros() as usize;
             let col = stack * DIM1 + k / DIM2;
@@ -306,20 +344,23 @@ fn find_hidden_single_col(
     None
 }
 
-fn find_hidden_single_row(
+fn find_hidden_row<Find: BitParallelCounter<StackRowMask>>(
     square_masks: &[StackRowMask; DIM3],
     unsolved_rows: &[StackRowMask; DIM1],
-) -> Option<(usize, Digit)> {
+) -> Option<(usize, Digit)>
+where
+    Find: Shr<usize, Output = Find>,
+{
     for band in 0..DIM1 {
         for sr in 0..DIM1 {
             let unsolved_mask = unsolved_rows[band] >> (sr * DIM2) & SQUARE_ALL;
             let row = band * DIM1 + sr;
-            let x = FindSingle::new(
+            let x = Find::new(
                 square_masks[row * DIM1 + 0],
                 square_masks[row * DIM1 + 1],
                 square_masks[row * DIM1 + 2],
             );
-            let mask = unsolved_mask & FindSingle::compute(x, x >> DIM2, x >> (DIM2 * 2));
+            let mask = unsolved_mask & Find::compute(x, x >> DIM2, x >> (DIM2 * 2));
             if mask != 0 {
                 return Some((row, unsafe {
                     Digit::new_unchecked(mask.trailing_zeros() as u8 + 1)
@@ -331,19 +372,22 @@ fn find_hidden_single_row(
     None
 }
 
-fn find_hidden_single_box(
+fn find_hidden_box<Find: BitParallelCounter<StackRowMask>>(
     square_masks: &[StackRowMask; DIM3],
     unsolved_boxes: &[StackRowMask; DIM1],
-) -> Option<(usize, Digit)> {
+) -> Option<(usize, Digit)>
+where
+    Find: Shr<usize, Output = Find>,
+{
     for band in 0..DIM1 {
         for stack in 0..DIM1 {
             let unsolved_mask = unsolved_boxes[band] >> (stack * DIM2) & SQUARE_ALL;
-            let x = FindSingle::new(
+            let x = Find::new(
                 square_masks[(band * DIM1 + 0) * DIM1 + stack],
                 square_masks[(band * DIM1 + 1) * DIM1 + stack],
                 square_masks[(band * DIM1 + 2) * DIM1 + stack],
             );
-            let mask = unsolved_mask & FindSingle::compute(x, x >> DIM2, x >> (DIM2 * 2));
+            let mask = unsolved_mask & Find::compute(x, x >> DIM2, x >> (DIM2 * 2));
             if mask != 0 {
                 let r#box = band * DIM1 + stack;
                 return Some((DIM2 * 2 + r#box, unsafe {
@@ -415,49 +459,41 @@ impl State {
     }
 
     pub fn check_square_masks(&self) -> bool {
-        let mut total = SQUARE_ALL;
-        for row in 0..DIM2 {
-            let mask = (0..DIM1)
-                .map(|s| self.square_masks[row * 3 + s])
+        let mut total = STACK_ROW_ALL;
+        for stack in 0..DIM1 {
+            let mask = (0..DIM2)
+                .map(|b| self.square_masks[b * DIM1 + stack])
                 .fold(0, BitOr::bitor);
-            total &= (0..DIM1)
-                .map(|sc| mask >> (sc * DIM2))
-                .fold(0, BitOr::bitor);
+            total &= mask;
         }
-        // for band in 0..DIM1 {
-        //     for stack in 0..DIM1 {
-        //         let mask = (0..DIM1)
-        //             .map(|s| self.square_masks[(band * DIM1 + s) * DIM1 + stack])
-        //             .fold(0, BitOr::bitor);
-        //         total &= (0..DIM1)
-        //             .map(|sc| mask >> (sc * DIM2))
-        //             .fold(0, BitOr::bitor);
-        //     }
-        // }
-        // for stack in 0..DIM1 {
-        //     let mask = (0..DIM2)
-        //         .map(|b| self.square_masks[b * DIM1 + stack])
-        //         .fold(0, BitOr::bitor);
-        //     total &= (0..DIM1)
-        //         .map(|sc| mask >> (sc * DIM2))
-        //         .fold(!0, BitAnd::bitand);
-        // }
-        total == SQUARE_ALL
+
+        total == STACK_ROW_ALL
     }
 
     pub fn find_hidden_single(&self) -> Option<(SquareIndex, Digit)> {
-        let hidden_single = find_hidden_single_col(&self.square_masks, &self.unsolved_cols)
-            .or_else(|| find_hidden_single_row(&self.square_masks, &self.unsolved_rows))
-            .or_else(|| find_hidden_single_box(&self.square_masks, &self.unsolved_boxes));
+        find_hidden_col::<FindSingle<_>>(&self.square_masks, &self.unsolved_cols)
+            .or_else(|| find_hidden_row::<FindSingle<_>>(&self.square_masks, &self.unsolved_rows))
+            .or_else(|| find_hidden_box::<FindSingle<_>>(&self.square_masks, &self.unsolved_boxes))
+            .map(|(unit, d)| {
+                let mask = self.digit_mask(d) & MASK.all_units[unit];
+                debug_assert!(mask.count_ones() == 1);
+                let i = unsafe { SquareIndex::new_unchecked(mask.get().trailing_zeros() as usize) };
+                (i, d)
+            })
+    }
 
-        if let Some((unit, d)) = hidden_single {
-            let mask = self.digit_mask(d) & MASK.all_units[unit];
-            debug_assert!(!mask.is_zero());
-            let i = unsafe { SquareIndex::new_unchecked(mask.get().trailing_zeros() as usize) };
-            return Some((i, d));
-        }
-
-        None
+    pub fn find_hidden_pair(&self) -> Option<[(SquareIndex, Digit); 2]> {
+        find_hidden_col::<FindPair<_>>(&self.square_masks, &self.unsolved_cols)
+            .or_else(|| find_hidden_row::<FindPair<_>>(&self.square_masks, &self.unsolved_rows))
+            .or_else(|| find_hidden_box::<FindPair<_>>(&self.square_masks, &self.unsolved_boxes))
+            .map(|(unit, d)| {
+                let mask = self.digit_mask(d) & MASK.all_units[unit];
+                debug_assert!(mask.count_ones() == 2);
+                let mut iter = iter_mask_indices(mask);
+                let i = iter.next().unwrap();
+                let j = iter.next().unwrap();
+                [(i, d), (j, d)]
+            })
     }
 }
 
@@ -474,24 +510,17 @@ pub fn find_naked_singles(state: &State) -> GridMask {
 
 pub fn find_naked_pair(state: &State) -> Option<SquareIndex> {
     let get = |x, y, z| {
-        let x = state.digit_mask(Digit::new(x));
-        let y = state.digit_mask(Digit::new(y));
-        let z = state.digit_mask(Digit::new(z));
-        (
-            (x ^ y ^ z) & !(x & y & z),
-            x | y | z,
-            !(x ^ y ^ z) & (x | y | z),
+        FindPair::new(
+            state.digit_mask(Digit::new(x)),
+            state.digit_mask(Digit::new(y)),
+            state.digit_mask(Digit::new(z)),
         )
     };
-    let x = get(1, 2, 3);
-    let y = get(4, 5, 6);
-    let z = get(7, 8, 9);
-    let naked_pairs_a = x.0 & y.0 & !z.1 | x.0 & z.0 & !y.1 | y.0 & z.0 & !x.1;
-    let naked_pairs_b = x.2 & !(y.1 | z.1) | y.2 & !(x.1 | z.1) | z.2 & !(x.1 | y.1);
-    if !naked_pairs_b.is_zero() {
-        iter_mask_indices(naked_pairs_b).next()
+    let (a, b) = FindPair::compute_parts(get(1, 2, 3), get(4, 5, 6), get(7, 8, 9));
+    if !b.is_zero() {
+        iter_mask_indices(b).next()
     } else {
-        iter_mask_indices(naked_pairs_a).next()
+        iter_mask_indices(a).next()
     }
 }
 
@@ -581,29 +610,30 @@ impl Solver {
         changed
     }
 
-    fn branch_impl(
-        &mut self,
-        state: &State,
-        tuple: impl IntoIterator<Item = (SquareIndex, Digit)>,
-    ) {
-        for (i, d) in tuple.into_iter() {
-            let mut clone = state.clone();
-            self.put(&mut clone, i, d);
-            self.solve_dfs(clone);
-        }
+    fn branch_on_pair(&mut self, mut state: State, pair: [(SquareIndex, Digit); 2]) {
+        let mut clone = state.clone();
+        self.put(&mut clone, pair[0].0, pair[0].1);
+        self.solve_dfs(clone);
+
+        self.put(&mut state, pair[1].0, pair[1].1);
+        self.solve_dfs(state)
     }
 
-    fn branch(&mut self, state: &State) {
-        let mut min = (10, Digit::new(1), GridMask::default());
-
-        if let Some(i) = find_naked_pair(state) {
-            return self.branch_impl(
-                state,
-                Digit::all()
-                    .filter(|d| state.is_candidate(i, *d))
-                    .map(|d| (i, d)),
-            );
+    fn branch(&mut self, state: State) {
+        if let Some(i) = find_naked_pair(&state) {
+            let mut iter = Digit::all().filter(|d| state.is_candidate(i, *d));
+            let d0 = iter.next().unwrap();
+            let d1 = iter.next().unwrap();
+            return self.branch_on_pair(state, [(i, d0), (i, d1)]);
         }
+
+        if let Some(pair) = state.find_hidden_pair() {
+            return self.branch_on_pair(state, pair);
+        }
+
+        eprintln!("No pairs found!");
+
+        let mut min = (10, Digit::new(1), GridMask::default());
 
         let all_units = &MASK.all_units;
 
@@ -627,7 +657,11 @@ impl Solver {
             }
         }
 
-        self.branch_impl(&state, iter_mask_indices(min.2).map(move |i| (i, min.1)));
+        for i in iter_mask_indices(min.2) {
+            let mut clone = state.clone();
+            self.put(&mut clone, i, min.1);
+            self.solve_dfs(clone);
+        }
     }
 
     fn solve_dfs(&mut self, mut state: State) {
@@ -647,7 +681,7 @@ impl Solver {
             if let Some((i, d)) = state.find_hidden_single() {
                 self.put(&mut state, i, d);
             } else {
-                return self.branch(&state);
+                return self.branch(state);
             }
         }
     }
