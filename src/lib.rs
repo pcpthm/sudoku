@@ -16,7 +16,7 @@ pub static REC_COUNT: AtomicU64 = AtomicU64::new(0);
 
 const DIM1: usize = 3;
 const DIM2: usize = DIM1 * DIM1;
-const DIM3: usize = DIM1 * DIM1 * DIM1;
+// const DIM3: usize = DIM1 * DIM1 * DIM1;
 const DIM4: usize = DIM2 * DIM2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

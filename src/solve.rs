@@ -1,10 +1,10 @@
 #![allow(clippy::needless_range_loop, clippy::identity_op)]
 
-use super::{Digit, Grid, SquareIndex, DIM1, DIM2, DIM3, DIM4};
+use super::{Digit, Grid, SquareIndex, DIM1, DIM2, DIM4};
 use core::arch::x86_64::{__m128i, _mm_and_si128, _mm_or_si128, _mm_xor_si128};
 use lazy_static::lazy_static;
 use std::mem::transmute;
-use std::ops::{BitAnd, BitAndAssign, BitOr, BitXor, Not, Shr};
+use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, Not, Shr};
 
 #[repr(align(16))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -79,10 +79,21 @@ impl BitOr for GridMask {
         unsafe { _mm_or_si128(self.into(), rhs.into()).into() }
     }
 }
+impl BitOrAssign for GridMask {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = *self | rhs;
+    }
+}
 impl BitXor for GridMask {
     type Output = Self;
     fn bitxor(self, rhs: Self) -> Self {
         unsafe { _mm_xor_si128(self.into(), rhs.into()).into() }
+    }
+}
+impl Shr<usize> for GridMask {
+    type Output = Self;
+    fn shr(self, rhs: usize) -> Self {
+        Self::new(self.get() >> rhs)
     }
 }
 
@@ -112,24 +123,27 @@ const UNIT_TYPES: usize = 3;
 struct Constants {
     all_units: [GridMask; DIM2 * UNIT_TYPES],
     adj: [GridMask; DIM4],
+    same_col: [[GridMask; DIM2]; DIM2],
+    same_box: [[GridMask; DIM2]; DIM1],
+    same_row: [[GridMask; DIM2]; DIM2],
 }
 
 impl Constants {
     pub fn new() -> Self {
-        let mut rows = [GridMask::default(); DIM2];
         let mut cols = [GridMask::default(); DIM2];
+        let mut rows = [GridMask::default(); DIM2];
         let mut boxes = [[GridMask::default(); DIM1]; DIM1];
 
-        let r = (1u128 << DIM2) - 1;
         let c = (0..DIM2)
             .map(|i| 1u128 << (i * DIM2))
             .fold(0u128, BitOr::bitor);
+        let r = (1u128 << DIM2) - 1;
         let b = (0..DIM1)
             .flat_map(|y| (0..DIM1).map(move |x| 1u128 << (y * DIM2 + x)))
             .fold(0u128, BitOr::bitor);
         for i in 0..DIM2 {
-            rows[i] = (r << (i * DIM2)).into();
             cols[i] = (c << i).into();
+            rows[i] = (r << (i * DIM2)).into();
         }
         for y in 0..DIM1 {
             for x in 0..DIM1 {
@@ -139,8 +153,8 @@ impl Constants {
 
         let mut all_units = [GridMask::default(); DIM2 * UNIT_TYPES];
         for i in 0..DIM2 {
-            all_units[i] = rows[i];
-            all_units[DIM2 + i] = cols[i];
+            all_units[i] = cols[i];
+            all_units[DIM2 + i] = rows[i];
             all_units[DIM2 * 2 + i] = boxes[i / DIM1][i % DIM1];
         }
 
@@ -151,17 +165,40 @@ impl Constants {
             }
         }
 
-        Constants { all_units, adj }
+        let mut same_col = [[GridMask::default(); DIM2]; DIM2];
+        let mut same_box = [[GridMask::default(); DIM2]; DIM1];
+        let mut same_row = [[GridMask::default(); DIM2]; DIM2];
+
+        for d in 0..DIM2 {
+            for col in 0..DIM2 {
+                same_col[col][d] = GridMask::new(1u128 << (col * DIM2 + d));
+            }
+            for stack in 0..DIM1 {
+                same_box[stack][d] = (0..DIM1)
+                    .map(|sc| same_col[stack * DIM1 + sc][d])
+                    .fold(GridMask::default(), BitOr::bitor);
+            }
+            let row_mask = (0..DIM1)
+                .map(|s| same_box[s][d])
+                .fold(GridMask::default(), BitOr::bitor);
+            for col in 0..DIM2 {
+                same_row[col][d] = row_mask | GridMask::new(((1u128 << DIM2) - 1) << (col * DIM2));
+            }
+        }
+
+        Constants {
+            all_units,
+            adj,
+            same_col,
+            same_box,
+            same_row,
+        }
     }
 }
 
 lazy_static! {
     static ref MASK: Constants = Constants::new();
 }
-
-type StackRowMask = u32;
-const SQUARE_ALL: StackRowMask = (1u32 << DIM2) - 1;
-const STACK_ROW_ALL: StackRowMask = (1u32 << DIM3) - 1;
 
 #[derive(Debug, Clone)]
 pub struct State {
@@ -172,10 +209,10 @@ pub struct State {
     // mask of unsolved squares
     unsolved_mask: GridMask,
 
-    square_masks: [StackRowMask; DIM3],
-    unsolved_rows: [StackRowMask; DIM1],
-    unsolved_cols: [StackRowMask; DIM1],
-    unsolved_boxes: [StackRowMask; DIM1],
+    square_masks: [GridMask; DIM2],
+    unsolved_cols: GridMask,
+    unsolved_rows: [u16; DIM2],
+    unsolved_boxes: [u16; DIM2],
 }
 
 fn update_digit_masks(
@@ -205,47 +242,33 @@ fn update_digit_masks(
 fn update_square_masks(
     i: SquareIndex,
     d: Digit,
-    square_masks: &mut [StackRowMask; DIM3],
-    unsolved_rows: &mut [StackRowMask; DIM1],
-    unsolved_cols: &mut [StackRowMask; DIM1],
-    unsolved_boxes: &mut [StackRowMask; DIM1],
+    square_masks: &mut [GridMask; DIM2],
+    unsolved_cols: &mut GridMask,
+    unsolved_rows: &mut [u16; DIM2],
+    unsolved_boxes: &mut [u16; DIM2],
+    constants: &Constants,
 ) {
     const DIV3: [u8; 9] = [0, 0, 0, 1, 1, 1, 2, 2, 2];
-    const MOD3: [u8; 9] = [0, 1, 2, 0, 1, 2, 0, 1, 2];
     let d = d.get_index();
     let row = i.get() / DIM2;
     let col = i.get() % DIM2;
     let band = DIV3[row] as usize;
     let stack = DIV3[col] as usize;
-    let sub_row = MOD3[row] as usize;
-    let sub_col = MOD3[col] as usize;
 
-    *unsafe { unsolved_rows.get_unchecked_mut(band) } &= !(1u32 << (sub_row * DIM2 + d));
-    *unsafe { unsolved_cols.get_unchecked_mut(stack) } &= !(1u32 << (sub_col * DIM2 + d));
-    *unsafe { unsolved_boxes.get_unchecked_mut(band) } &= !(1u32 << (stack * DIM2 + d));
+    let same_col = *unsafe { constants.same_col.get_unchecked(col).get_unchecked(d) };
+    let same_box = *unsafe { constants.same_box.get_unchecked(stack).get_unchecked(d) };
+    let same_row = *unsafe { constants.same_row.get_unchecked(col).get_unchecked(d) };
 
-    let mask_one = 1u32 << (sub_col * DIM2 + d);
-    let mask_stack = (0..DIM1)
-        .map(|k| 1u32 << (k * DIM2 + d))
-        .fold(0, BitOr::bitor);
-    // for same column
-    for b in 0..DIM1 {
-        for sr in 0..DIM1 {
-            *unsafe { square_masks.get_unchecked_mut((b * DIM1 + sr) * DIM1 + stack) } &= !mask_one;
-        }
+    *unsafe { unsolved_rows.get_unchecked_mut(row) } &= !(1u16 << d);
+    *unsolved_cols &= !same_col;
+    *unsafe { unsolved_boxes.get_unchecked_mut(band * DIM1 + stack) } &= !(1u16 << d);
+
+    let mut masks = [same_col; 3];
+    *unsafe { masks.get_unchecked_mut(band) } = same_box;
+    for r in 0..DIM2 {
+        square_masks[r] &= !masks[r / DIM1];
     }
-    // for same row
-    for s in 0..DIM1 {
-        *unsafe { square_masks.get_unchecked_mut(row * DIM1 + s) } &= !mask_stack;
-    }
-    // for same box
-    for sr in 0..DIM1 {
-        *unsafe { square_masks.get_unchecked_mut((band * DIM1 + sr) * DIM1 + stack) } &=
-            !mask_stack;
-    }
-    // the square
-    let r = unsafe { square_masks.get_unchecked_mut(row * DIM1 + stack) };
-    *r = *r & !(SQUARE_ALL << (sub_col * DIM2)) | 1u32 << (sub_col * DIM2 + d);
+    square_masks[row] = square_masks[row] & !same_row | same_col;
 }
 
 trait BitParallelCounter<T>: Sized + Copy {
@@ -261,7 +284,8 @@ trait BitNum:
     + Not<Output = Self>
 {
 }
-impl BitNum for StackRowMask {}
+impl BitNum for u16 {}
+impl BitNum for u32 {}
 impl BitNum for GridMask {}
 
 #[derive(Debug, Clone, Copy)]
@@ -318,79 +342,65 @@ impl<T: BitNum> FindPair<T> {
     }
 }
 
-fn find_hidden_col<Find: BitParallelCounter<StackRowMask>>(
-    square_masks: &[StackRowMask; DIM3],
-    unsolved_cols: &[StackRowMask; DIM1],
+fn find_hidden_col<Find: BitParallelCounter<GridMask>>(
+    square_masks: &[GridMask; DIM2],
+    unsolved_cols: &GridMask,
 ) -> Option<(usize, Digit)> {
-    for stack in 0..DIM1 {
-        let unsolved_mask = unsolved_cols[stack];
+    let get = |x, y, z| Find::new(square_masks[x], square_masks[y], square_masks[z]);
+    let mask = *unsolved_cols & Find::compute(get(0, 1, 2), get(3, 4, 5), get(6, 7, 8));
+    if !mask.is_zero() {
+        let k = mask.get().trailing_zeros() as usize;
+        let col = k / DIM2;
+        return Some((col, unsafe { Digit::new_unchecked((k % DIM2) as u8 + 1) }));
+    }
+    None
+}
 
-        let get = |x, y, z| {
-            Find::new(
-                square_masks[x * DIM1 + stack],
-                square_masks[y * DIM1 + stack],
-                square_masks[z * DIM1 + stack],
-            )
-        };
-        let mask = unsolved_mask & Find::compute(get(0, 1, 2), get(3, 4, 5), get(6, 7, 8));
+fn find_hidden_row<Find: BitParallelCounter<u32>>(
+    square_masks: &[GridMask; DIM2],
+    unsolved_rows: &[u16; DIM2],
+) -> Option<(usize, Digit)>
+where
+    Find: Shr<usize, Output = Find>,
+{
+    for row in 0..DIM2 {
+        let row_mask = square_masks[row].get();
+        let find = Find::new(
+            (row_mask >> (0 * DIM1 * DIM2)) as u32,
+            (row_mask >> (1 * DIM1 * DIM2)) as u32,
+            (row_mask >> (2 * DIM1 * DIM2)) as u32,
+        );
+        let mask =
+            unsolved_rows[row] & Find::compute(find, find >> DIM2, find >> (2 * DIM2)) as u16;
         if mask != 0 {
-            let k = mask.trailing_zeros() as usize;
-            let col = stack * DIM1 + k / DIM2;
-            return Some((DIM2 + col, unsafe {
-                Digit::new_unchecked((k % DIM2) as u8 + 1)
+            return Some((DIM2 + row, unsafe {
+                Digit::new_unchecked(mask.trailing_zeros() as u8 + 1)
             }));
         }
     }
+
     None
 }
 
-fn find_hidden_row<Find: BitParallelCounter<StackRowMask>>(
-    square_masks: &[StackRowMask; DIM3],
-    unsolved_rows: &[StackRowMask; DIM1],
+fn find_hidden_box<Find: BitParallelCounter<GridMask>>(
+    square_masks: &[GridMask; DIM2],
+    unsolved_boxes: &[u16; DIM2],
 ) -> Option<(usize, Digit)>
 where
     Find: Shr<usize, Output = Find>,
 {
     for band in 0..DIM1 {
-        for sr in 0..DIM1 {
-            let unsolved_mask = unsolved_rows[band] >> (sr * DIM2) & SQUARE_ALL;
-            let row = band * DIM1 + sr;
-            let x = Find::new(
-                square_masks[row * DIM1 + 0],
-                square_masks[row * DIM1 + 1],
-                square_masks[row * DIM1 + 2],
-            );
-            let mask = unsolved_mask & Find::compute(x, x >> DIM2, x >> (DIM2 * 2));
-            if mask != 0 {
-                return Some((row, unsafe {
-                    Digit::new_unchecked(mask.trailing_zeros() as u8 + 1)
-                }));
-            }
-        }
-    }
-
-    None
-}
-
-fn find_hidden_box<Find: BitParallelCounter<StackRowMask>>(
-    square_masks: &[StackRowMask; DIM3],
-    unsolved_boxes: &[StackRowMask; DIM1],
-) -> Option<(usize, Digit)>
-where
-    Find: Shr<usize, Output = Find>,
-{
-    for band in 0..DIM1 {
+        let x = Find::new(
+            square_masks[band * DIM1 + 0],
+            square_masks[band * DIM1 + 1],
+            square_masks[band * DIM1 + 2],
+        );
+        let y = Find::compute(x, x >> DIM2, x >> (2 * DIM2));
         for stack in 0..DIM1 {
-            let unsolved_mask = unsolved_boxes[band] >> (stack * DIM2) & SQUARE_ALL;
-            let x = Find::new(
-                square_masks[(band * DIM1 + 0) * DIM1 + stack],
-                square_masks[(band * DIM1 + 1) * DIM1 + stack],
-                square_masks[(band * DIM1 + 2) * DIM1 + stack],
-            );
-            let mask = unsolved_mask & Find::compute(x, x >> DIM2, x >> (DIM2 * 2));
+            let boxi = band * DIM1 + stack;
+            let mask = unsolved_boxes[boxi] & ((y.get() >> (stack * DIM1 * DIM2)) as u16);
             if mask != 0 {
-                let r#box = band * DIM1 + stack;
-                return Some((DIM2 * 2 + r#box, unsafe {
+                return Some((DIM2 * 2 + boxi, unsafe {
                     Digit::new_unchecked(mask.trailing_zeros() as u8 + 1)
                 }));
             }
@@ -405,10 +415,10 @@ impl State {
         State {
             digit_masks: [GRID_ALL; DIM2],
             unsolved_mask: GRID_ALL,
-            square_masks: [STACK_ROW_ALL; DIM3],
-            unsolved_rows: [STACK_ROW_ALL; DIM1],
-            unsolved_cols: [STACK_ROW_ALL; DIM1],
-            unsolved_boxes: [STACK_ROW_ALL; DIM1],
+            square_masks: [GRID_ALL; DIM2],
+            unsolved_cols: GRID_ALL,
+            unsolved_rows: [(1u16 << DIM2) - 1; DIM2],
+            unsolved_boxes: [(1u16 << DIM2) - 1; DIM2],
         }
     }
 
@@ -425,11 +435,13 @@ impl State {
     }
 
     pub fn square_mask(&self, i: SquareIndex) -> u32 {
-        self.square_masks[i.get() / DIM1] >> (i.get() % DIM1 * DIM2) & SQUARE_ALL
+        let row = i.get() / DIM2;
+        let col = i.get() % DIM2;
+        (self.square_masks[row].get() >> (col * DIM2)) as u32 & ((1u32 << DIM2) - 1)
     }
 
     pub fn assign(&mut self, i: SquareIndex, d: Digit) {
-        //eprintln!("\nassign({:?}, {:?})", i, d);
+        // eprintln!("\nassign({:?}, {:?})", i, d);
         debug_assert!(self.is_candidate(i, d));
         let constants: &Constants = &MASK;
         update_digit_masks(
@@ -443,19 +455,20 @@ impl State {
             i,
             d,
             &mut self.square_masks,
-            &mut self.unsolved_rows,
             &mut self.unsolved_cols,
+            &mut self.unsolved_rows,
             &mut self.unsolved_boxes,
+            constants,
         );
 
-        for k in 0..DIM4 {
-            if self.unsolved_mask.get() >> k & 1 == 0 {
-                let mask = self.square_masks[k / DIM1] >> (k % DIM1 * DIM2) & SQUARE_ALL;
+        for i in SquareIndex::all() {
+            if !self.unsolved_mask.has_bit(i) {
+                let mask = self.square_mask(i);
                 debug_assert!(mask.count_ones() == 1);
             } else {
-                for d in 0..DIM2 {
-                    let a = self.digit_masks[d].get() >> k & 1 != 0;
-                    let b = self.square_masks[k / DIM1] >> (k % DIM1 * DIM2 + d) & 1 != 0;
+                for d in Digit::all() {
+                    let a = self.digit_mask(d).has_bit(i);
+                    let b = self.square_mask(i) >> d.get_index() & 1 != 0;
                     debug_assert!(a == b);
                 }
             }
@@ -463,15 +476,11 @@ impl State {
     }
 
     pub fn check_square_masks(&self) -> bool {
-        let mut total = STACK_ROW_ALL;
-        for stack in 0..DIM1 {
-            let mask = (0..DIM2)
-                .map(|b| self.square_masks[b * DIM1 + stack])
-                .fold(0, BitOr::bitor);
-            total &= mask;
+        let mut total = GridMask::default();
+        for row_mask in &self.square_masks {
+            total |= *row_mask;
         }
-
-        total == STACK_ROW_ALL
+        total == GRID_ALL
     }
 
     pub fn find_hidden_single(&self) -> Option<(SquareIndex, Digit)> {
@@ -704,9 +713,10 @@ impl Solver {
 
             if let Some((i, d)) = state.find_hidden_single() {
                 self.put(&mut state, i, d);
-            } else {
-                return self.branch(state);
+                continue;
             }
+
+            return self.branch(state);
         }
     }
 
