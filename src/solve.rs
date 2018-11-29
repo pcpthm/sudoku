@@ -567,7 +567,16 @@ impl Solver {
         if mask == GRID_NONE {
             return Some(false);
         }
-        for i in iter_mask_indices(mask) {
+        // Only apply one naked single for each band.
+        // (Recursion count is the same because apply_naked_singles is before other steps).
+        for band in 0..DIM1 {
+            let band_mask = unsafe { mask.extract_unchecked(band) };
+            if band_mask == 0 {
+                continue;
+            }
+            let bitpos = band_mask.trailing_zeros() as usize;
+            let i = unsafe { SquareIndex::new_unchecked(band * DIM3 + bitpos) };
+
             let square_mask = state.square_mask(i);
             if square_mask == 0 {
                 return None;
