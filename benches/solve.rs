@@ -2,15 +2,16 @@ extern crate criterion;
 extern crate sudoku;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use std::{
-    fs::File,
-    io::{BufRead, BufReader},
-};
 
 fn bench(c: &mut Criterion) {
-    let f = BufReader::new(File::open("sample25.txt").unwrap());
-    for line in f.lines().take(5) {
-        let line = line.unwrap();
+    let f = "\
+000000001001002030040050600006005700050030040800900000007004300060070020900800000
+000000001000002340003010520001004005060031070700800003004005002090060000800000900
+000000001000002030004150600000070080007001000060490700046000009095000300700960500
+000000001000002340003010250001005004060000000700800600004003002090700000800020090
+000000001000001230001020450002003004060040070800900002005004003070800000900060000
+";
+    for line in f.lines() {
         let problem = sudoku::parse(line.trim()).unwrap();
         c.bench_function(line.trim(), move |b| b.iter(|| sudoku::solve(&problem)));
     }
